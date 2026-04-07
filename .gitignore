@@ -1,0 +1,11 @@
+.env
+__pycache__/
+.venv/
+points.db
+points.db-journal
+points.db-wal
+backups/
+point-counter.service
+*.pyc
+.claude/
+CLAUDE.md

@@ -1,0 +1,15 @@
+[Unit]
+Description=Discord Point Counter Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/point-counter
+ExecStart=/path/to/uv run bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
