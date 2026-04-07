@@ -5,6 +5,8 @@ description = "Discord bot for tracking points given between users"
 requires-python = ">=3.12"
 dependencies = [
     "discord-py>=2.3,<3.0",
+    "matplotlib>=3.8",
     "python-dotenv>=1.2.2",
     "sqlalchemy>=2.0",
+    "sympy>=1.13",
 ]
