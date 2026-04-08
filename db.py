@@ -1,3 +1,4 @@
+import math
 import shutil
 import time
 from decimal import Decimal, InvalidOperation, getcontext
@@ -8,6 +9,7 @@ getcontext().prec = 500
 from pathlib import Path
 
 from sqlalchemy import (
+    Boolean,
     Float,
     Index,
     Integer,
@@ -15,6 +17,7 @@ from sqlalchemy import (
     TypeDecorator,
     create_engine,
     delete,
+    text,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -23,22 +26,26 @@ from sqlalchemy.orm import (
 )
 
 
-Points = Decimal | Fraction
+Points = Decimal | Fraction | complex
 
 
 class DecimalString(TypeDecorator):
-    """Store Decimal/Fraction as TEXT, return appropriate type on read."""
+    """Store Decimal/Fraction/complex as TEXT, return appropriate type on read."""
     impl = String
     cache_ok = True
 
     def process_bind_param(self, value, dialect):
         if value is not None:
+            if isinstance(value, complex):
+                return repr(value)
             return str(value)
         return value
 
     def process_result_value(self, value, dialect):
         if value is not None:
             s = str(value)
+            if 'j' in s:
+                return complex(s)
             if '/' in s:
                 return Fraction(s)
             return Decimal(s)
@@ -49,11 +56,23 @@ def _to_decimal(val: Points) -> Decimal:
     """Convert any point value to Decimal."""
     if isinstance(val, Decimal):
         return val
-    return Decimal(val.numerator) / Decimal(val.denominator)
+    if isinstance(val, Fraction):
+        return Decimal(val.numerator) / Decimal(val.denominator)
+    raise TypeError(f"Cannot convert {type(val).__name__} to Decimal")
+
+
+def _to_complex(val: Points) -> complex:
+    """Convert any point value to complex."""
+    if isinstance(val, complex):
+        return val
+    return complex(float(val), 0)
 
 
 def _add_points(a: Points, b: Points) -> Points:
-    """Add two point values, handling Fraction/Decimal mix."""
+    """Add two point values, handling Fraction/Decimal/complex mix."""
+    # Complex tier: if either is complex, promote both
+    if isinstance(a, complex) or isinstance(b, complex):
+        return _to_complex(a) + _to_complex(b)
     if isinstance(a, Decimal) and (a.is_nan() or a.is_infinite()):
         return a + _to_decimal(b)
     if isinstance(b, Decimal) and (b.is_nan() or b.is_infinite()):
@@ -80,6 +99,7 @@ class Transaction(Base):
     points = mapped_column(DecimalString, nullable=False)
     reason = mapped_column(String, nullable=True)
     created_at = mapped_column(Float, nullable=False)
+    is_reset = mapped_column(Boolean, default=False)
 
     __table_args__ = (
         Index("ix_guild_to_user", "guild_id", "to_user_id"),
@@ -92,6 +112,15 @@ SessionLocal = sessionmaker(bind=engine)
 
 def init_db():
     Base.metadata.create_all(engine)
+    # Migration: add is_reset column if missing
+    with engine.connect() as conn:
+        try:
+            conn.execute(text(
+                "ALTER TABLE transactions ADD COLUMN is_reset BOOLEAN DEFAULT 0"
+            ))
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
 
 
 def add_transaction(
@@ -100,6 +129,7 @@ def add_transaction(
     to_user_id: str,
     points: Decimal,
     reason: str | None,
+    is_reset: bool = False,
 ) -> Transaction:
     with SessionLocal() as session:
         txn = Transaction(
@@ -109,6 +139,7 @@ def add_transaction(
             points=points,
             reason=reason,
             created_at=time.time(),
+            is_reset=is_reset,
         )
         session.add(txn)
         session.commit()
@@ -119,48 +150,68 @@ def add_transaction(
 def get_user_points(guild_id: str, user_id: str) -> Points:
     with SessionLocal() as session:
         rows = (
-            session.query(Transaction.points)
+            session.query(Transaction.points, Transaction.is_reset)
             .filter(
                 Transaction.guild_id == guild_id,
                 Transaction.to_user_id == user_id,
             )
+            .order_by(Transaction.created_at.asc())
             .all()
         )
         total: Points = Fraction(0)
-        for (pts,) in rows:
-            try:
-                total = _add_points(total, pts)
-            except InvalidOperation:
-                return Decimal("NaN")
+        for pts, is_reset in rows:
+            if is_reset:
+                total = pts
+            else:
+                try:
+                    total = _add_points(total, pts)
+                except InvalidOperation:
+                    total = Decimal("NaN")
         return total
 
 
-def get_leaderboard(guild_id: str, limit: int = 10) -> list[tuple[str, Decimal]]:
+def get_guild_totals(guild_id: str) -> dict[str, Points]:
+    """Return {user_id: total_points} for all users in a guild."""
     with SessionLocal() as session:
         rows = (
-            session.query(Transaction.to_user_id, Transaction.points)
+            session.query(Transaction.to_user_id, Transaction.points, Transaction.is_reset)
             .filter(Transaction.guild_id == guild_id)
+            .order_by(Transaction.created_at.asc())
             .all()
         )
-    # Aggregate in Python for exact arithmetic
     totals: dict[str, Points] = {}
-    for user_id, pts in rows:
-        try:
-            totals[user_id] = _add_points(totals.get(user_id, Fraction(0)), pts)
-        except InvalidOperation:
-            totals[user_id] = Decimal("NaN")
+    for user_id, pts, is_reset in rows:
+        if is_reset:
+            totals[user_id] = pts
+        else:
+            try:
+                totals[user_id] = _add_points(totals.get(user_id, Fraction(0)), pts)
+            except InvalidOperation:
+                totals[user_id] = Decimal("NaN")
+    return totals
 
-    def _sort_key(item: tuple[str, Points]) -> tuple[int, Fraction]:
-        val = item[1]
-        if isinstance(val, Decimal):
-            if val.is_nan():
-                return (-3, Fraction(0))
-            if val.is_infinite():
-                return (2, Fraction(0)) if not val.is_signed() else (-2, Fraction(0))
-            return (1, Fraction(val))
-        return (1, val)
 
-    ranked = sorted(totals.items(), key=_sort_key, reverse=True)
+def default_sort_key(item: tuple[str, Points]) -> tuple[int, Fraction]:
+    """Default leaderboard sort: +Inf > reals > complex(magnitude) > -Inf > NaN."""
+    val = item[1]
+    if isinstance(val, complex):
+        if math.isnan(val.real) or math.isnan(val.imag):
+            return (-3, Fraction(0))
+        if math.isinf(val.real) or math.isinf(val.imag):
+            return (2, Fraction(0))
+        return (0, Fraction(abs(val)))
+    if isinstance(val, Decimal):
+        if val.is_nan():
+            return (-3, Fraction(0))
+        if val.is_infinite():
+            return (2, Fraction(0)) if not val.is_signed() else (-2, Fraction(0))
+        return (1, Fraction(val))
+    return (1, val)
+
+
+def get_leaderboard(guild_id: str, limit: int = 10) -> list[tuple[str, Decimal]]:
+    totals = get_guild_totals(guild_id)
+    ranked = sorted(totals.items(), key=default_sort_key, reverse=True)
     return ranked[:limit]
 
 
@@ -251,17 +302,24 @@ def get_last_nan_give_time(guild_id: str, from_user_id: str) -> float | None:
 
 
 def is_user_nan(guild_id: str, user_id: str) -> bool:
-    """Check if a user has any NaN transactions."""
+    """Check if a user's current total is NaN."""
+    total = get_user_points(guild_id, user_id)
+    if isinstance(total, complex):
+        return math.isnan(total.real) or math.isnan(total.imag)
+    return isinstance(total, Decimal) and total.is_nan()
+
+
+def delete_user_transactions(guild_id: str, user_id: str) -> int:
+    """Delete all transactions targeting a user. Returns count deleted."""
     with SessionLocal() as session:
-        return (
-            session.query(Transaction)
-            .filter(
+        result = session.execute(
+            delete(Transaction).where(
                 Transaction.guild_id == guild_id,
                 Transaction.to_user_id == user_id,
-                Transaction.points.like("%NaN%"),
             )
-            .first()
-        ) is not None
+        )
+        session.commit()
+        return result.rowcount
 
 
 def delete_nan_transactions(guild_id: str, user_id: str) -> int:

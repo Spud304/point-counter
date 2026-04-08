@@ -2,6 +2,7 @@
 import ast as _ast
 import io
 import logging
+import math as _math
 from decimal import Decimal
 from fractions import Fraction
 
@@ -10,8 +11,10 @@ log = logging.getLogger("point-counter")
 MAX_DISPLAY_LEN = 100
 
 
-def needs_latex(val: Decimal | Fraction) -> bool:
+def needs_latex(val: Decimal | Fraction | complex) -> bool:
     """Return True if the value would benefit from LaTeX rendering."""
+    if isinstance(val, complex):
+        return True
     if isinstance(val, Fraction):
         if val.denominator == 1:
             return len(str(val.numerator)) > MAX_DISPLAY_LEN
@@ -39,8 +42,45 @@ def needs_latex(val: Decimal | Fraction) -> bool:
     return False
 
 
-def _val_to_latex(val: Decimal | Fraction) -> str:
+def _val_to_latex(val: Decimal | Fraction | complex) -> str:
     """Convert a point value to a LaTeX string."""
+    if isinstance(val, complex):
+        r, im = val.real, val.imag
+
+        def _fl(f: float) -> str:
+            if _math.isnan(f):
+                return r"\mathrm{NaN}"
+            if _math.isinf(f):
+                return r"-\infty" if f < 0 else r"\infty"
+            if f == int(f):
+                return str(int(f))
+            return str(f)
+
+        has_real = r != 0 or _math.isnan(r)
+        has_imag = im != 0 or _math.isnan(im)
+
+        if not has_imag:
+            return _fl(r)
+
+        # Format imaginary coefficient
+        if _math.isnan(im):
+            im_latex = r"\mathrm{NaN} \cdot \mathrm{i}"
+        elif abs(im) == 1:
+            im_latex = r"\mathrm{i}"
+        else:
+            im_latex = f"{_fl(abs(im))}\\mathrm{{i}}"
+
+        if not has_real:
+            if im < 0 and not _math.isnan(im):
+                return f"-{im_latex}"
+            return im_latex
+
+        # Both parts
+        r_latex = _fl(r)
+        if _math.isnan(im) or im > 0:
+            return f"{r_latex} + {im_latex}"
+        return f"{r_latex} - {im_latex}"
+
     if isinstance(val, Fraction):
         if val.denominator == 1:
             s = str(val.numerator)
@@ -115,7 +155,7 @@ def _node_to_latex(node) -> str:
         return str(node.value)
 
     if isinstance(node, _ast.Name):
-        names = {'p': 'p', 'e': 'e', 'pi': r'\pi', 'inf': r'\infty'}
+        names = {'p': 'p', 'e': 'e', 'pi': r'\pi', 'inf': r'\infty', 'i': r'\mathrm{i}'}
         return names.get(node.id, rf'\mathrm{{{node.id}}}')
 
     if isinstance(node, _ast.UnaryOp):
